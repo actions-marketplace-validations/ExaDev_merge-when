@@ -1,6 +1,6 @@
 # merge-when
 
-Merges a pull request once conditions you list all hold, without relying on GitHub's own auto-merge or branch protection. [`merge-when-green`](https://github.com/ExaDev/merge-when-green) is this action with the conditions for "labelled, green and discussed" filled in.
+Merges a pull request, or marks a draft ready for review, once conditions you list all hold, without relying on GitHub's own auto-merge or branch protection. [`merge-when-green`](https://github.com/ExaDev/merge-when-green) is this action with the conditions for "labelled, green and discussed" filled in.
 
 ## When to use this
 
@@ -57,7 +57,7 @@ A pull request is considered only when it still has the commit that triggered th
 
 ## Conditions
 
-`when` lists one condition per line, and every line must hold. Blank lines and lines starting with `#` are ignored. An unknown condition fails the run before any pull request is touched, so a typo can't silently drop a safeguard.
+`when` lists one condition per line, and every line must hold. Blank lines and lines starting with `#` are ignored. An unknown condition, or a value given to a condition that takes none or missing from one that needs it, fails the run before any pull request is touched, so a typo can't silently drop a safeguard. The checking is done by [`when-core`](https://github.com/ExaDev/when-core), shared by the `when` actions.
 
 | Condition          | Holds when                                                                                                                                                                          |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -68,6 +68,47 @@ A pull request is considered only when it still has the commit that triggered th
 | `approvals: <n>`   | at least `n` reviewers' latest review is an approval and none requests changes                                                                                                      |
 | `author: <a>, <b>` | the author's login is one of those listed, such as `dependabot[bot]`                                                                                                                |
 | `base: <branch>`   | the pull request targets that branch                                                                                                                                                |
+
+## Marking drafts ready
+
+With `then: ready`, a draft whose conditions all hold is marked ready for review instead of merged. Run it beside a merge workflow so that agents or people can open pull requests as drafts and leave them to become reviewable, and then mergeable, once CI is green:
+
+```yaml
+name: Ready when
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+concurrency:
+  group: ready-when-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  ready:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ExaDev/merge-when@v1
+        with:
+          then: ready
+          merge-token: ${{ secrets.MERGE_TOKEN }}
+          when: |
+            label: automerge
+            check: Required checks
+            threads-resolved
+```
+
+- **CI has to run on drafts.** The aggregate check must report on a draft's head commit, so don't skip CI jobs with `if: github.event.pull_request.draft == false` or leave `ready_for_review` as the only trigger; GitHub's default `pull_request` types already include drafts.
+- **The token must not be `GITHUB_TOKEN`.** GitHub starts no workflow from an event that token caused, so a pull request it marked ready would never trigger the `ready_for_review` run of the merge workflow. Give `merge-token`, or `app-id` and `app-private-key`; the action refuses to run without one.
+- **`then: ready` takes no merge settings.** `not-draft` (which a draft can never meet), `merge-method`, `ssh-key` and `update-behind` are each rejected before any pull request is touched.
+- **It is reversible but not pinned.** `gh pr ready` has no head-commit pin, so a push landing between the check and the call is readied with it. A pull request readied wrongly goes back with `gh pr ready <number> --undo`.
 
 ## Credentials
 
@@ -87,7 +128,8 @@ A deploy key is an SSH key and cannot call the API, so it only works with `fast-
 | Input                       | Default             | Meaning                                                                |
 | --------------------------- | ------------------- | ---------------------------------------------------------------------- |
 | `when`                      | required            | The conditions, above                                                  |
-| `merge-method`              | `rebase`            | `rebase`, `squash`, `merge` or `fast-forward`                          |
+| `then`                      | `merge`             | `merge`, or `ready` to mark a draft ready for review                   |
+| `merge-method`              | `rebase`            | `rebase`, `squash`, `merge` or `fast-forward`, for `then: merge`       |
 | `merge-token`               |                     | An API token                                                           |
 | `app-id`, `app-private-key` |                     | A GitHub App to mint a token from                                      |
 | `ssh-key`                   |                     | A write deploy key, for `fast-forward`                                 |
@@ -97,7 +139,7 @@ A deploy key is an SSH key and cannot call the API, so it only works with `fast-
 
 ## Development
 
-`npm test` runs the [bats](https://bats-core.readthedocs.io) suite for `merge.sh` against fake `gh` and `git` executables and the unit tests for the release plugins, and `npm run shellcheck` lints the script. CI also runs commitlint, actionlint, typecheck, lint and format checks, aggregated into one `Required Checks` job.
+`npm test` runs the [bats](https://bats-core.readthedocs.io) suite for `merge.sh` against fake `gh` and `git` executables and the unit tests for the release plugins, and `npm run shellcheck` lints the script. CI also runs the composite action itself from the checkout, so its `when-core` step is exercised against the published `v1`, and commitlint, actionlint, typecheck, lint and format checks, aggregated into one `Required Checks` job.
 
 This repository merges its own labelled pull requests with the action, using `fast-forward` and the release deploy key (`.github/workflows/merge-when.yml`).
 

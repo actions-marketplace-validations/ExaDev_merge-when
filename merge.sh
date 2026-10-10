@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Merges each open pull request that has $HEAD_SHA at its head and satisfies every condition in $WHEN.
+# Applies $THEN to each open pull request that has $HEAD_SHA at its head and satisfies every condition in $WHEN: merges it, or marks a draft ready for review.
+#
+# The action's when-core step has already checked WHEN and THEN against this script's vocabulary and failed the run on anything it doesn't know, before this script starts.
 #
 # Inputs (environment):
 #   GH_TOKEN      reads pull requests, checks and review threads
 #   REPO          owner/name
 #   HEAD_SHA      the commit the triggering event is about
-#   WHEN          one condition per line (blank lines and lines starting with # are ignored):
+#   WHEN          one condition per line, as when-core outputs them (blank lines and lines starting with # are skipped, so raw input also runs):
 #                   label: <name>        the pull request carries the label
 #                   check: <name>        a check run of that name succeeded on the head commit
 #                   threads-resolved     no review thread is unresolved
@@ -13,56 +15,61 @@
 #                   approvals: <n>       at least n approvals and no outstanding request for changes
 #                   author: <a>, <b>     the author's login is one of those listed
 #                   base: <branch>       the pull request targets that branch
-#   MERGE_METHOD  rebase, squash or merge (through the API, with MERGE_TOKEN), or fast-forward (a push of the head commit to the base branch, with MERGE_TOKEN over https or SSH_KEY over SSH)
+#   THEN          merge, or ready to mark a draft ready for review (with MERGE_TOKEN, never GITHUB_TOKEN, so ready_for_review workflows start)
+#   MERGE_METHOD  for merge: rebase (when empty), squash or merge (through the API, with MERGE_TOKEN), or fast-forward (a push of the head commit to the base branch, with MERGE_TOKEN over https or SSH_KEY over SSH); ready takes none
 #   MERGE_TOKEN   an API token: a personal access token or a GitHub App installation token
 #   SSH_KEY       the private half of a write deploy key, for fast-forward only
 #   UPDATE_BEHIND true to rebase a fast-forward pull request that is behind its base onto it and push the result to its branch (never a fork's), instead of leaving it
 set -euo pipefail
 
 : "${WHEN:?when is required}"
+: "${THEN:?then is required}"
 
-case "$MERGE_METHOD" in
-  rebase | squash | merge)
-    : "${MERGE_TOKEN:?a merge token is required for merge-method $MERGE_METHOD}"
-    if [ -n "${SSH_KEY-}" ]; then
-      echo "ssh-key is only used by merge-method fast-forward." >&2
-      exit 1
-    fi
-    ;;
-  fast-forward)
-    if [ -n "${MERGE_TOKEN-}" ] && [ -n "${SSH_KEY-}" ]; then
-      echo "Give fast-forward one credential, a token or an ssh-key, not both." >&2
-      exit 1
-    fi
-    if [ -z "${MERGE_TOKEN-}" ] && [ -z "${SSH_KEY-}" ]; then
-      echo "merge-method fast-forward needs a token or an ssh-key." >&2
-      exit 1
-    fi
-    ;;
-  *)
-    echo "merge-method must be rebase, squash, merge or fast-forward, not \"$MERGE_METHOD\"." >&2
-    exit 1
-    ;;
-esac
+fail() {
+  echo "$1" >&2
+  exit 1
+}
 
-# Every line must be a known condition, checked before any pull request is touched, so a typo fails the run instead of silently dropping a safeguard.
 conditions=()
 while IFS= read -r line; do
   line="${line#"${line%%[![:space:]]*}"}"
   line="${line%"${line##*[![:space:]]}"}"
   case "$line" in
-    "" | "#"*) continue ;;
-    "label: "* | "check: "* | "approvals: "* | "author: "* | "base: "* | threads-resolved | not-draft) conditions+=("$line") ;;
-    *)
-      echo "Unknown condition: \"$line\"." >&2
-      exit 1
-      ;;
+    "" | "#"*) ;;
+    *) conditions+=("$line") ;;
   esac
 done <<<"$WHEN"
-if [ "${#conditions[@]}" = 0 ]; then
-  echo "when has no conditions." >&2
-  exit 1
-fi
+[ "${#conditions[@]}" != 0 ] || fail "when has no conditions."
+
+# Every combination of then with the other inputs is checked here, before any pull request is touched.
+case "$THEN" in
+  merge)
+    MERGE_METHOD="${MERGE_METHOD:-rebase}"
+    case "$MERGE_METHOD" in
+      rebase | squash | merge)
+        : "${MERGE_TOKEN:?a merge token is required for merge-method $MERGE_METHOD}"
+        [ -z "${SSH_KEY-}" ] || fail "ssh-key is only used by merge-method fast-forward."
+        ;;
+      fast-forward)
+        { [ -z "${MERGE_TOKEN-}" ] || [ -z "${SSH_KEY-}" ]; } || fail "Give fast-forward one credential, a token or an ssh-key, not both."
+        { [ -n "${MERGE_TOKEN-}" ] || [ -n "${SSH_KEY-}" ]; } || fail "merge-method fast-forward needs a token or an ssh-key."
+        ;;
+      *) fail "merge-method must be rebase, squash, merge or fast-forward, not \"$MERGE_METHOD\"." ;;
+    esac
+    ;;
+  ready)
+    # Only a draft can be marked ready, so a not-draft condition would never hold.
+    for condition in "${conditions[@]}"; do
+      [ "$condition" != not-draft ] || fail "then: ready acts on drafts, so it can't be combined with the not-draft condition."
+    done
+    [ -z "${MERGE_METHOD-}" ] || fail "merge-method is only used by then: merge."
+    [ -z "${SSH_KEY-}" ] || fail "ssh-key is only used by then: merge with merge-method fast-forward."
+    [ "${UPDATE_BEHIND-false}" = false ] || fail "update-behind is only used by then: merge with merge-method fast-forward."
+    # GitHub starts no workflow from an event caused by GITHUB_TOKEN, so marking a pull request ready with it would never trigger the ready_for_review runs that act on it next.
+    [ -n "${MERGE_TOKEN-}" ] || fail "then: ready needs merge-token or app-id, so the ready_for_review event starts workflows, which GITHUB_TOKEN can't."
+    ;;
+  *) fail "then must be merge or ready, not \"$THEN\"." ;;
+esac
 
 owner="${REPO%%/*}"
 name="${REPO##*/}"
@@ -112,6 +119,8 @@ holds() {
     "base: "*)
       [ "$(jq -r '.baseRefName' <<<"$pr")" = "$value" ] || { reason="doesn't target $value"; return 1; }
       ;;
+    # when-core rejects an unknown condition before this script runs; one reaching here must still never hold vacuously.
+    *) fail "Unknown condition: \"$condition\"." ;;
   esac
 }
 
@@ -154,6 +163,17 @@ for number in $pulls; do
     fi
   done
   [ "$met" = true ] || continue
+
+  if [ "$THEN" = ready ]; then
+    # gh pr ready has no head-commit pin, unlike the merge; a pull request readied wrongly is undone with gh pr ready --undo.
+    if [ "$(jq -r '.isDraft' <<<"$pr")" = false ]; then
+      echo "#$number is already ready for review."
+    else
+      GH_TOKEN="$MERGE_TOKEN" gh pr ready "$number" --repo "$REPO"
+      echo "Marked #$number ready for review."
+    fi
+    continue
+  fi
 
   if [ "$MERGE_METHOD" = fast-forward ]; then
     base=$(jq -r '.baseRefName' <<<"$pr")
